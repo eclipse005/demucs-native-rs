@@ -76,13 +76,8 @@ jobs:
             archive: tar.gz
             bin: demucs-native
 
-          - name: macos-x64-cpu
-            os: macos-13
-            target: x86_64-apple-darwin
-            features: ""
-            artifact: macos-x64-cpu
-            archive: tar.gz
-            bin: demucs-native
+          # macos-x64 (Intel) omitted: macos-13 runners are scarce/deprecated on GHA.
+          # Re-add with os: macos-13 if you need it.
 
     steps:
       - name: Checkout
@@ -229,7 +224,7 @@ jobs:
             ### Archives
             - `*-linux-x64-cpu` / `*-linux-x64-cuda12`
             - `*-windows-x64-cpu` / `*-windows-x64-cuda12`
-            - `*-macos-arm64-cpu` / `*-macos-x64-cpu`
+            - `*-macos-arm64-cpu`
 
             CUDA builds require a local NVIDIA driver + CUDA 12 user-mode libraries.
             Kernels are NVRTC-compiled for the **device arch at runtime** (e.g. GTX 1050 Ti sm_61).

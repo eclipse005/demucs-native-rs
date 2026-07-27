@@ -21,7 +21,6 @@ GitHub Releases ship platform archives (models are **not** included):
 | `demucs-native-*-windows-x64-cpu.zip` | CPU-only Windows |
 | `demucs-native-*-windows-x64-cuda12.zip` | Windows + CUDA 12 |
 | `demucs-native-*-macos-arm64-cpu.tar.gz` | Apple Silicon CPU |
-| `demucs-native-*-macos-x64-cpu.tar.gz` | Intel Mac CPU (optional) |
 
 CUDA builds need a local **CUDA 12.x driver + runtime** (toolkit not required at runtime when using dynamic loading). They are compiled on GitHub runners **without a GPU**; real GPU testing is done on your machine.
 
