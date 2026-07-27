@@ -22,30 +22,23 @@ GitHub Releases ship platform archives (models are **not** included):
 | `demucs-native-*-windows-x64-cuda12.zip` | Windows + CUDA 12 |
 | `demucs-native-*-macos-arm64-cpu.tar.gz` | Apple Silicon CPU |
 
-CUDA builds need a local **CUDA 12.x driver + runtime** (toolkit not required at runtime when using dynamic loading). They are compiled on GitHub runners **without a GPU**; real GPU testing is done on your machine.
+CUDA builds need a local **CUDA 12.x driver + runtime** (toolkit not required at runtime when using dynamic loading). They are compiled on GitHub runners **without a GPU**; real GPU testing is done on your machine. NVRTC compiles kernels for the **device arch at runtime** (not hard-coded to a specific SM).
 
-### Ubuntu + GTX 1050 Ti (sm_61)
-
-NVRTC compiles kernels for the **device arch at runtime** — Pascal cards work; nothing is hard-coded to modern SMs only.
+### Linux
 
 ```bash
-# 1) Download release asset (example)
-tar xzf demucs-native-v0.1.0-rc1-linux-x64-cuda12.tar.gz
-cd demucs-native-v0.1.0-rc1-linux-x64-cuda12
-
-# 2) Models (see below) into ./models
-# 3) CPU smoke
+tar xzf demucs-native-v0.1.0-rc3-linux-x64-cuda12.tar.gz
+cd demucs-native-v0.1.0-rc3-linux-x64-cuda12
+# put *.safetensors in ./models (see below)
 ./demucs-native -i sample.wav -o ./out-cpu -m htdemucs --model-dir ./models --device cpu
-
-# 4) CUDA smoke (needs NVIDIA driver + CUDA 12 user-mode libs)
 ./demucs-native -i sample.wav -o ./out-cuda -m htdemucs --model-dir ./models --device cuda
 ```
 
 ### Windows
 
 ```powershell
-Expand-Archive demucs-native-v0.1.0-rc1-windows-x64-cuda12.zip
-cd demucs-native-v0.1.0-rc1-windows-x64-cuda12
+Expand-Archive demucs-native-v0.1.0-rc3-windows-x64-cuda12.zip
+cd demucs-native-v0.1.0-rc3-windows-x64-cuda12
 .\demucs-native.exe -i sample.wav -o .\out-cpu -m htdemucs --model-dir .\models --device cpu
 .\demucs-native.exe -i sample.wav -o .\out-cuda -m htdemucs --model-dir .\models --device cuda
 ```
@@ -106,7 +99,7 @@ cargo build --release --no-default-features
 cargo build --release --features cuda
 ```
 
-`cudarc` uses `cuda-version-from-build-system` so the installed toolkit version is detected at build time. NVRTC loads `kernels.cu` and compiles for the GPU’s compute capability when you run (e.g. sm_61 on GTX 1050 Ti).
+`cudarc` uses `cuda-version-from-build-system` so the installed toolkit version is detected at build time. NVRTC loads `kernels.cu` and compiles for the GPU’s compute capability when you run.
 
 ## Features
 

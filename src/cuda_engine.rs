@@ -452,6 +452,9 @@ use crate::{ops_cpu, TRAINING_LENGTH};
 pub(crate) struct CudaModel {
     pub(crate) sig: String,
     pub(crate) model: crate::gpu_model::GpuHTDemucs,
+    /// Target stem for bagged fine-tunes (`htdemucs_ft`: one model per stem).
+    /// `None` for single-signature models that emit all stems at once.
+    pub(crate) stem_id: Option<crate::metadata::StemId>,
 }
 
 pub struct CudaEngine {
@@ -481,19 +484,21 @@ impl CudaEngine {
         let n_sources = info.stems.len();
         let bottom_channels = if n_sources == 6 { 384 } else { 512 };
 
-        let sigs_to_load: Vec<String> = if info.signatures.len() == 1 {
-            vec![info.signatures[0].to_string()]
-        } else {
-            info.stems
-                .iter()
-                .enumerate()
-                .filter(|(_, &s)| selected_stems.contains(&s))
-                .map(|(i, _)| info.signatures[i].to_string())
-                .collect()
-        };
+        // (signature, optional per-stem id for bagged fine-tunes)
+        let to_load: Vec<(String, Option<crate::metadata::StemId>)> =
+            if info.signatures.len() == 1 {
+                vec![(info.signatures[0].to_string(), None)]
+            } else {
+                info.stems
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &s)| selected_stems.contains(&s))
+                    .map(|(i, &s)| (info.signatures[i].to_string(), Some(s)))
+                    .collect()
+            };
 
-        let mut models = Vec::with_capacity(sigs_to_load.len());
-        for sig in &sigs_to_load {
+        let mut models = Vec::with_capacity(to_load.len());
+        for (sig, stem_id) in &to_load {
             anyhow::ensure!(
                 store.signature(sig).is_some(),
                 "signature {} not found in weight store",
@@ -506,6 +511,7 @@ impl CudaEngine {
             models.push(CudaModel {
                 sig: sig.clone(),
                 model: gpu_model,
+                stem_id: *stem_id,
             });
         }
 
@@ -527,16 +533,6 @@ impl CudaEngine {
         })
     }
 
-    /// GPU pipeline: H2D + forward + D2H. Returns raw denorm buffers (caller does post-processing).
-    fn gpu_chunk(
-        &self,
-        freq_n: Vec<f32>,
-        time_n: Vec<f32>,
-        n_frames: usize,
-    ) -> Result<(Vec<f32>, Vec<f32>)> {
-        Self::gpu_chunk_on(&self.state, &self.models[0].model, freq_n, time_n, n_frames)
-    }
-
     /// Static version for use from a spawned thread where CudaEngine can't be borrowed.
     fn gpu_chunk_on(
         state: &Arc<CudaState>,
@@ -547,17 +543,47 @@ impl CudaEngine {
     ) -> Result<(Vec<f32>, Vec<f32>)> {
         let freq_shape = [1, 4, crate::N_FFT / 2, n_frames];
         let time_shape = [1, 2, TRAINING_LENGTH];
-        // Normal forward — output correctness preserved.
         let gf = state.upload_f32_as_f16(&freq_n, freq_shape.to_vec())?;
         let gt = state.upload_f32_as_f16(&time_n, time_shape.to_vec())?;
         let (gf_out, gt_out) = crate::cuda_ops::htdemucs_forward(state, &gf, &gt, model)?;
         let f_dl = state.download_to_f32_fast(&gf_out)?;
         let t_dl = state.download_to_f32_fast(&gt_out)?;
-
         Ok((f_dl, t_dl))
     }
 
+    /// Denormalize GPU outputs and extract stem waveforms.
+    fn extract_from_gpu_out(
+        f_dl: &mut [f32],
+        t_dl: &mut [f32],
+        n_sources: usize,
+        n_frames: usize,
+        padded_len: usize,
+        n_samples: usize,
+        fmean: &[f32],
+        fstd: &[f32],
+        tmean: &[f32],
+        tstd: &[f32],
+        stft: &mut Stft,
+    ) -> Vec<Stem> {
+        let f_shape = [
+            1,
+            n_sources * 4,
+            f_dl.len() / (n_sources * 4 * n_frames),
+            n_frames,
+        ];
+        let t_shape = [1, n_sources * 2, t_dl.len() / (n_sources * 2)];
+        ops_cpu::denormalize_freq(f_dl, f_shape, fmean, fstd);
+        ops_cpu::denormalize_time(t_dl, t_shape, tmean, tstd);
+        ops_cpu::extract_stems(
+            f_dl, f_shape, t_dl, t_shape, n_frames, padded_len, n_samples, stft,
+        )
+    }
+
     /// Short-audio path (no chunking): single segment.
+    ///
+    /// Single-signature models: one forward, all stems.
+    /// Bagged fine-tunes (`htdemucs_ft`): one forward **per** signature, keep
+    /// only that model's target stem (matches CPU engine).
     fn separate_single_segment(&self, left: &[f32], right: &[f32]) -> Result<Vec<Stem>> {
         let n_samples = left.len();
         let padded_len = TRAINING_LENGTH;
@@ -582,16 +608,126 @@ impl CudaEngine {
         let (freq_n, _, fmean, _, fstd, _) = ops_cpu::normalize_freq(&freq, freq_shape);
         let (time_n, _, tmean, _, tstd, _) = ops_cpu::normalize_time(&time, time_shape);
 
-        let (f_dl, t_dl) = self.gpu_chunk(freq_n, time_n, n_frames)?;
+        let stems = if self.models.len() == 1 {
+            let (mut f_dl, mut t_dl) =
+                Self::gpu_chunk_on(&self.state, &self.models[0].model, freq_n, time_n, n_frames)?;
+            let stems = Self::extract_from_gpu_out(
+                &mut f_dl,
+                &mut t_dl,
+                self.n_sources,
+                n_frames,
+                padded_len,
+                n_samples,
+                &fmean,
+                &fstd,
+                &tmean,
+                &tstd,
+                &mut stft,
+            );
+            stems
+                .into_iter()
+                .filter(|s| self.selected_stems.contains(&s.id))
+                .collect()
+        } else {
+            // htdemucs_ft: one model per stem signature.
+            let mut out_stems: Vec<Stem> = Vec::with_capacity(self.models.len());
+            for cm in &self.models {
+                let stem_id = cm.stem_id.ok_or_else(|| {
+                    anyhow!("bagged CUDA model {} missing stem_id", cm.sig)
+                })?;
+                let (mut f_dl, mut t_dl) = Self::gpu_chunk_on(
+                    &self.state,
+                    &cm.model,
+                    freq_n.clone(),
+                    time_n.clone(),
+                    n_frames,
+                )?;
+                let stems = Self::extract_from_gpu_out(
+                    &mut f_dl,
+                    &mut t_dl,
+                    self.n_sources,
+                    n_frames,
+                    padded_len,
+                    n_samples,
+                    &fmean,
+                    &fstd,
+                    &tmean,
+                    &tstd,
+                    &mut stft,
+                );
+                if let Some(s) = stems.into_iter().find(|s| s.id == stem_id) {
+                    out_stems.push(s);
+                } else {
+                    return Err(anyhow!(
+                        "bagged model {} did not produce target stem {:?}",
+                        cm.sig,
+                        stem_id
+                    ));
+                }
+            }
+            out_stems
+        };
 
-        let f_shape = [1, self.n_sources * 4, f_dl.len() / (self.n_sources * 4 * n_frames), n_frames];
-        let t_shape = [1, self.n_sources * 2, t_dl.len() / (self.n_sources * 2)];
-        ops_cpu::denormalize_freq(&mut f_dl.clone(), f_shape, &fmean, &fstd);
-        ops_cpu::denormalize_time(&mut t_dl.clone(), t_shape, &tmean, &tstd);
-        let stems = ops_cpu::extract_stems(&f_dl, f_shape, &t_dl, t_shape, n_frames, padded_len, padded_len, &mut stft);
-
-        let stems: Vec<_> = stems.into_iter().filter(|s| self.selected_stems.contains(&s.id)).collect();
         Ok(stems)
+    }
+
+    /// Long-audio path for bagged fine-tunes: sequential chunks via
+    /// [`Self::separate_single_segment`] (runs every signature per chunk).
+    fn separate_chunked_bagged(&self, left: &[f32], right: &[f32]) -> Result<Vec<Stem>> {
+        let n_samples = left.len();
+        let segment = TRAINING_LENGTH;
+        let stride = segment * 3 / 4;
+        let num_chunks = n_samples.saturating_sub(segment).div_ceil(stride) + 1;
+        let n_stems = self.info.stems.len();
+
+        let mut out_left = vec![vec![0.0f32; n_samples]; n_stems];
+        let mut out_right = vec![vec![0.0f32; n_samples]; n_stems];
+        let mut sum_weight = vec![0.0f32; n_samples];
+
+        for chunk_idx in 0..num_chunks {
+            let start = chunk_idx * stride;
+            let end = (start + segment).min(n_samples);
+            let chunk_len = end - start;
+            let chunk_stems =
+                self.separate_single_segment(&left[start..end], &right[start..end])?;
+            let window = crate::cpu_engine::triangular_window(chunk_len);
+            for stem in &chunk_stems {
+                let s = self
+                    .info
+                    .stems
+                    .iter()
+                    .position(|&id| id == stem.id)
+                    .ok_or_else(|| anyhow!("unknown stem {:?}", stem.id))?;
+                for i in 0..chunk_len {
+                    let w = window[i];
+                    out_left[s][start + i] += w * stem.left[i];
+                    out_right[s][start + i] += w * stem.right[i];
+                }
+            }
+            for i in 0..chunk_len {
+                sum_weight[start + i] += window[i];
+            }
+        }
+
+        let mut stems = Vec::with_capacity(n_stems);
+        for (s, &stem_id) in self.info.stems.iter().enumerate() {
+            for i in 0..n_samples {
+                let w = sum_weight[i];
+                if w > 0.0 {
+                    out_left[s][i] /= w;
+                    out_right[s][i] /= w;
+                }
+            }
+            stems.push(crate::Stem {
+                id: stem_id,
+                left: std::mem::take(&mut out_left[s]),
+                right: std::mem::take(&mut out_right[s]),
+            });
+        }
+        Ok(stems
+            .into_iter()
+            .filter(|s| self.selected_stems.contains(&s.id))
+            .collect())
     }
 
     /// Run source separation on stereo audio.
@@ -617,10 +753,18 @@ impl CudaEngine {
         let n_samples = left.len();
 
         if n_samples <= TRAINING_LENGTH {
-            return self.separate_single_segment(left, right);
+            let stems = self.separate_single_segment(left, right)?;
+            return self.maybe_resample_stems(stems, needs_resample, sample_rate);
         }
 
-        // Pipelined multi-threaded chunk processing:
+        // Bagged fine-tune: every signature must run (mirrors CPU). Use sequential
+        // chunking rather than the single-model prep/gpu/post pipeline.
+        if self.models.len() > 1 {
+            let stems = self.separate_chunked_bagged(left, right)?;
+            return self.maybe_resample_stems(stems, needs_resample, sample_rate);
+        }
+
+        // Single-model pipelined multi-threaded chunk processing:
         //
         // Timing per chunk:
         //   Background thread: prep (STFT+cac+normalize) ~24ms
@@ -629,11 +773,6 @@ impl CudaEngine {
         //   Post (denorm+extract+oa): ~75ms
         //
         // Pipeline: GPU runs on chunk N while background threads prep chunks N+1,N+2,...
-        // D2H is the pipeline hazard: CPU thread blocks waiting for it while GPU is idle.
-        // This means GPU idle time = D2H duration - post of next chunk.
-        // With 345ms D2H and ~75ms post: GPU is idle for ~270ms per chunk.
-        //
-        // Expected wall: sum of (GPU+D2H_blocked) = ~437ms × 31 + startup ≈ 13.6s (vs 22s sequential = 1.6× win).
         let segment = TRAINING_LENGTH;
         let stride = segment * 3 / 4;
         let num_chunks = n_samples.saturating_sub(segment).div_ceil(stride) + 1;
@@ -660,14 +799,14 @@ impl CudaEngine {
         let gpu_state = self.state.clone();
         let model = std::sync::Arc::new(self.models[0].model.clone());
 
-        // GPU thread: owns engine, processes prepped chunks as they arrive.
-        // This allows prep (next chunk) and post (prev chunk) to overlap with GPU.
+        // GPU thread: processes prepped chunks as they arrive.
         let gpu_handle = {
             let rx_prep = rx_prep;
             let tx_gpu = tx_gpu;
             std::thread::spawn(move || {
                 for (chunk_idx, freq_n, time_n, fmean, fstd, tmean, tstd, n_frames, chunk_len) in rx_prep {
-                    let (f_dl, t_dl) = Self::gpu_chunk_on(&gpu_state, &model, freq_n, time_n, n_frames).expect("gpu_chunk failed");
+                    let (f_dl, t_dl) = Self::gpu_chunk_on(&gpu_state, &model, freq_n, time_n, n_frames)
+                        .expect("gpu_chunk failed");
                     let _ = tx_gpu.send((chunk_idx, f_dl, t_dl, fmean, fstd, tmean, tstd, n_frames, chunk_len));
                 }
             })
@@ -715,7 +854,6 @@ impl CudaEngine {
         };
 
         // Post thread: denorm + extract + triangular OA.
-        // Runs concurrently with GPU (overlapping the ~345ms D2H blocking).
         let out_left = std::sync::Arc::new(std::sync::Mutex::new(out_left));
         let out_right = std::sync::Arc::new(std::sync::Mutex::new(out_right));
         let sum_weight = std::sync::Arc::new(std::sync::Mutex::new(sum_weight));
@@ -725,18 +863,23 @@ impl CudaEngine {
             let sum_weight = sum_weight.clone();
             std::thread::spawn(move || {
                 let mut stft = Stft::new(crate::N_FFT, crate::HOP_LENGTH);
-                for (chunk_idx, f_dl, t_dl, fmean, fstd, tmean, tstd, n_frames, chunk_len) in rx_gpu {
+                for (chunk_idx, mut f_dl, mut t_dl, fmean, fstd, tmean, tstd, n_frames, chunk_len) in rx_gpu {
                     let start = chunk_idx * stride;
                     let end = (start + segment).min(n_samples);
                     let this_len = end - start;
 
-                    let f_shape = [1, n_sources * 4, f_dl.len() / (n_sources * 4 * n_frames), n_frames];
-                    let t_shape = [1, n_sources * 2, t_dl.len() / (n_sources * 2)];
-                    ops_cpu::denormalize_freq(&mut f_dl.clone(), f_shape, &fmean, &fstd);
-                    ops_cpu::denormalize_time(&mut t_dl.clone(), t_shape, &tmean, &tstd);
-
-                    let stems = ops_cpu::extract_stems(
-                        &f_dl, f_shape, &t_dl, t_shape, n_frames, segment, chunk_len, &mut stft,
+                    let stems = Self::extract_from_gpu_out(
+                        &mut f_dl,
+                        &mut t_dl,
+                        n_sources,
+                        n_frames,
+                        segment,
+                        chunk_len,
+                        &fmean,
+                        &fstd,
+                        &tmean,
+                        &tstd,
+                        &mut stft,
                     );
 
                     let window = crate::cpu_engine::triangular_window(chunk_len);
@@ -764,12 +907,10 @@ impl CudaEngine {
         gpu_handle.join().expect("gpu thread panicked");
         post_handle.join().expect("post thread panicked");
 
-        // Normalize by window sum.
         let sum_weight = std::sync::Arc::try_unwrap(sum_weight).unwrap().into_inner().unwrap();
         let mut out_left = std::sync::Arc::try_unwrap(out_left).unwrap().into_inner().unwrap();
         let mut out_right = std::sync::Arc::try_unwrap(out_right).unwrap().into_inner().unwrap();
 
-        // Normalize by window sum.
         let mut stems = Vec::with_capacity(n_stems);
         for (s, &stem_id) in info.iter().enumerate() {
             for i in 0..n_samples {
@@ -787,20 +928,35 @@ impl CudaEngine {
         }
 
         let stems: Vec<_> = stems.into_iter().filter(|s| selected_stems.contains(&s.id)).collect();
+        self.maybe_resample_stems(stems, needs_resample, sample_rate)
+    }
 
-        if needs_resample {
-            let mut resampled = Vec::with_capacity(stems.len());
-            for mut stem in stems {
-                stem.left = crate::dsp::resample::resample_channel(&stem.left, crate::SAMPLE_RATE as u32, sample_rate)
-                    .map_err(|e| anyhow!("resample: {e}"))?;
-                stem.right = crate::dsp::resample::resample_channel(&stem.right, crate::SAMPLE_RATE as u32, sample_rate)
-                    .map_err(|e| anyhow!("resample: {e}"))?;
-                resampled.push(stem);
-            }
-            Ok(resampled)
-        } else {
-            Ok(stems)
+    fn maybe_resample_stems(
+        &self,
+        stems: Vec<Stem>,
+        needs_resample: bool,
+        sample_rate: u32,
+    ) -> Result<Vec<Stem>> {
+        if !needs_resample {
+            return Ok(stems);
         }
+        let mut resampled = Vec::with_capacity(stems.len());
+        for mut stem in stems {
+            stem.left = crate::dsp::resample::resample_channel(
+                &stem.left,
+                crate::SAMPLE_RATE as u32,
+                sample_rate,
+            )
+            .map_err(|e| anyhow!("resample: {e}"))?;
+            stem.right = crate::dsp::resample::resample_channel(
+                &stem.right,
+                crate::SAMPLE_RATE as u32,
+                sample_rate,
+            )
+            .map_err(|e| anyhow!("resample: {e}"))?;
+            resampled.push(stem);
+        }
+        Ok(resampled)
     }
 }
 

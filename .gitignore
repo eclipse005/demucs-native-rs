@@ -7,11 +7,11 @@
 /models/
 *.safetensors
 
-# Local audio / stems / debug dumps
+# Local audio / stems / debug dumps / benches
 /stems/
+/bench_out/
 *.wav
 *.bin
-!tests/**/*.wav
 
 # IDE / OS
 .idea/
