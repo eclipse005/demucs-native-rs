@@ -1,0 +1,240 @@
+# Build multi-platform demucs-native binaries and attach to a GitHub Release.
+# Trigger: push tags v* or workflow_dispatch (manual).
+#
+# CUDA jobs install Toolkit 12.x and compile only (no GPU on free runners).
+# CPU jobs: cargo build --release --no-default-features
+# CUDA jobs: cargo build --release --features cuda
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and publish (e.g. v0.1.0-rc1). Leave empty to use run id."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ─── matrix of CPU / CUDA builds ───────────────────────────────────────────
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64-cpu
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            features: ""
+            artifact: linux-x64-cpu
+            archive: tar.gz
+            bin: demucs-native
+
+          - name: linux-x64-cuda12
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            features: "cuda"
+            artifact: linux-x64-cuda12
+            archive: tar.gz
+            bin: demucs-native
+            cuda: "12.6.0"
+
+          - name: windows-x64-cpu
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+            features: ""
+            artifact: windows-x64-cpu
+            archive: zip
+            bin: demucs-native.exe
+
+          - name: windows-x64-cuda12
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+            features: "cuda"
+            artifact: windows-x64-cuda12
+            archive: zip
+            bin: demucs-native.exe
+            cuda: "12.6.0"
+
+          - name: macos-arm64-cpu
+            os: macos-14
+            target: aarch64-apple-darwin
+            features: ""
+            artifact: macos-arm64-cpu
+            archive: tar.gz
+            bin: demucs-native
+
+          - name: macos-x64-cpu
+            os: macos-13
+            target: x86_64-apple-darwin
+            features: ""
+            artifact: macos-x64-cpu
+            archive: tar.gz
+            bin: demucs-native
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      - name: Install CUDA Toolkit (Linux)
+        if: matrix.cuda != '' && runner.os == 'Linux'
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: ${{ matrix.cuda }}
+          method: network
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev"]'
+          non-cuda-sub-packages: '["g++"]'
+
+      - name: Install CUDA Toolkit (Windows)
+        if: matrix.cuda != '' && runner.os == 'Windows'
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: ${{ matrix.cuda }}
+          method: network
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "visual_studio_integration"]'
+
+      - name: Verify nvcc (CUDA builds)
+        if: matrix.cuda != ''
+        shell: bash
+        run: |
+          nvcc --version
+          echo "CUDA_PATH=${CUDA_PATH:-}"
+          which nvcc || true
+
+      - name: Build (CPU)
+        if: matrix.features == ''
+        shell: bash
+        run: cargo build --release --no-default-features --target ${{ matrix.target }}
+
+      - name: Build (CUDA)
+        if: matrix.features == 'cuda'
+        shell: bash
+        run: cargo build --release --features cuda --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            if [[ -n "${{ github.event.inputs.tag }}" ]]; then
+              VERSION="${{ github.event.inputs.tag }}"
+            else
+              VERSION="run-${{ github.run_id }}"
+            fi
+          fi
+          NAME="demucs-native-${VERSION}-${{ matrix.artifact }}"
+          mkdir -p "dist/${NAME}"
+          BIN="target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          cp "$BIN" "dist/${NAME}/"
+          {
+            echo "demucs-native ${VERSION} (${{ matrix.artifact }})"
+            echo ""
+            echo "Models are NOT included. Put *.safetensors in ./models and run:"
+            echo "  ./${{ matrix.bin }} -i input.wav -o ./stems -m htdemucs --model-dir ./models --device auto"
+            echo ""
+            echo "See https://github.com/eclipse005/demucs-native-rs for full docs."
+          } > "dist/${NAME}/README.txt"
+          cd dist
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            if command -v 7z >/dev/null 2>&1; then
+              7z a -tzip "${NAME}.zip" "${NAME}"
+            else
+              powershell -Command "Compress-Archive -Path '${NAME}' -DestinationPath '${NAME}.zip'"
+            fi
+          else
+            tar czf "${NAME}.tar.gz" "${NAME}"
+          fi
+          ls -la
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: demucs-native-${{ matrix.artifact }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  # ─── create / update GitHub Release ────────────────────────────────────────
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    # Only auto-publish when a real version tag was pushed (or dispatch with tag).
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '')
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print -exec cp {} release-assets/ \;
+          ls -lah release-assets
+
+      - name: Resolve tag
+        id: meta
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.tag }}" ]]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
+          draft: false
+          prerelease: ${{ contains(steps.meta.outputs.tag, '-') }}
+          generate_release_notes: true
+          body: |
+            Prebuilt `demucs-native` binaries for HTDemucs v4 (CPU / CUDA 12).
+
+            **Models are not attached** (too large). Download `*.safetensors` separately and pass `--model-dir`.
+
+            ### Archives
+            - `*-linux-x64-cpu` / `*-linux-x64-cuda12`
+            - `*-windows-x64-cpu` / `*-windows-x64-cuda12`
+            - `*-macos-arm64-cpu` / `*-macos-x64-cpu`
+
+            CUDA builds require a local NVIDIA driver + CUDA 12 user-mode libraries.
+            Kernels are NVRTC-compiled for the **device arch at runtime** (e.g. GTX 1050 Ti sm_61).
+
+            ### Quick test
+            ```bash
+            ./demucs-native -i sample.wav -o ./out -m htdemucs --model-dir ./models --device cpu
+            ./demucs-native -i sample.wav -o ./out -m htdemucs --model-dir ./models --device cuda
+            ```
+          files: release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

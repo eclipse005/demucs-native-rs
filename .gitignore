@@ -1,0 +1,25 @@
+# Rust
+/target/
+**/*.rs.bk
+# Keep Cargo.lock committed for reproducible release binaries.
+
+# Models (large; not shipped in releases)
+/models/
+*.safetensors
+
+# Local audio / stems / debug dumps
+/stems/
+*.wav
+*.bin
+!tests/**/*.wav
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Env / secrets
+.env
+.env.*
