@@ -98,14 +98,17 @@ jobs:
         with:
           key: ${{ matrix.name }}
 
+      # cudarc uses dynamic-loading by default: only nvcc is required at build
+      # time (cuda-version-from-build-system). Runtime needs a local driver +
+      # CUDA 12 user-mode libs (cublas, cudart) on the target machine.
       - name: Install CUDA Toolkit (Linux)
         if: matrix.cuda != '' && runner.os == 'Linux'
         uses: Jimver/cuda-toolkit@v0.2.21
         with:
           cuda: ${{ matrix.cuda }}
           method: network
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev"]'
-          non-cuda-sub-packages: '["g++"]'
+          sub-packages: '["nvcc"]'
+          use-github-cache: true
 
       - name: Install CUDA Toolkit (Windows)
         if: matrix.cuda != '' && runner.os == 'Windows'
@@ -113,7 +116,8 @@ jobs:
         with:
           cuda: ${{ matrix.cuda }}
           method: network
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "visual_studio_integration"]'
+          sub-packages: '["nvcc", "visual_studio_integration"]'
+          use-github-cache: true
 
       - name: Verify nvcc (CUDA builds)
         if: matrix.cuda != ''
