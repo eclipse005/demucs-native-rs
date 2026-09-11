@@ -929,15 +929,27 @@ impl CudaEngine {
         };
 
         prep_handle.join().expect("prep thread panicked");
-        gpu_handle.join().expect("gpu thread panicked");
+        // Drain completion signals *while* the GPU/post pipeline is still
+        // running — joining the GPU thread first would block this thread until
+        // every chunk is finished, turning the whole run into one progress
+        // burst at the very end.
         let mut done = 0usize;
-        while rx_done.recv().is_ok() {
-            done += 1;
-            on_progress(SeparationProgress {
-                done,
-                total: num_chunks,
-            });
+        loop {
+            match rx_done.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(_) => {
+                    done += 1;
+                    on_progress(SeparationProgress {
+                        done,
+                        total: num_chunks,
+                    });
+                }
+                // Timeout: producers may still be working; keep waiting.
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                // Channel closed: the post thread finished (or panicked).
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
         }
+        gpu_handle.join().expect("gpu thread panicked");
         post_handle.join().expect("post thread panicked");
 
         let sum_weight = std::sync::Arc::try_unwrap(sum_weight).unwrap().into_inner().unwrap();
