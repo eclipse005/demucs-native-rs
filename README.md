@@ -82,6 +82,12 @@ demucs-native -i <input.wav> [options]
 
 `--device cuda` only works in binaries built with the `cuda` feature. CPU-only builds accept `auto` / `cpu`.
 
+Long audio is processed in `TRAINING_LENGTH` chunks; the CLI prints chunk-level
+progress (`progress  42% (126/300)`) on stderr while separating. Library users get
+the same information from `Demucs::separate_with_progress(..., &mut |p| ...)`
+(`p.done` / `p.total` / `p.percent()`), which is what the OneAsr GUI uses to show
+「人声分离 n/N」in its task list.
+
 ## Build from source
 
 **Requirements:** Rust 1.75+ (edition 2021).

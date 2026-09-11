@@ -37,6 +37,32 @@ pub use backend::Backend;
 pub use error::{DemucsError, Result};
 pub use metadata::{ModelInfo, StemId, ALL_MODELS};
 
+/// Progress of one [`Demucs::separate_with_progress`] run.
+///
+/// One work unit is a `TRAINING_LENGTH` chunk of the (44.1 kHz) audio. For
+/// bagged fine-tunes (`htdemucs_ft`) every bag model runs inside one unit, so
+/// `total` matches the number of chunks the engine actually processes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeparationProgress {
+    pub done: usize,
+    pub total: usize,
+}
+
+impl SeparationProgress {
+    /// Completion in `0.0..=1.0` (`1.0` when `total` is 0 to avoid div-by-zero).
+    pub fn fraction(&self) -> f32 {
+        if self.total == 0 {
+            return 1.0;
+        }
+        (self.done as f32 / self.total as f32).clamp(0.0, 1.0)
+    }
+
+    /// Completion in percent, rounded down.
+    pub fn percent(&self) -> u32 {
+        (self.fraction() * 100.0) as u32
+    }
+}
+
 use std::path::Path;
 
 // ─── Model hyperparameters (HTDemucs v4) ─────────────────────────────────────
@@ -157,10 +183,28 @@ impl Demucs {
         right: &[f32],
         sample_rate: u32,
     ) -> anyhow::Result<Vec<Stem>> {
+        self.separate_with_progress(left, right, sample_rate, &mut |_| {})
+    }
+
+    /// [`Self::separate`] while reporting chunk-level progress.
+    ///
+    /// The callback runs on the calling thread; it may be called many times for
+    /// long audio (once per chunk) and always ends at `done == total`.
+    pub fn separate_with_progress(
+        &self,
+        left: &[f32],
+        right: &[f32],
+        sample_rate: u32,
+        on_progress: &mut dyn FnMut(SeparationProgress),
+    ) -> anyhow::Result<Vec<Stem>> {
         match &self.inner {
             #[cfg(feature = "cuda")]
-            DemucsInner::Cuda(e) => e.separate(left, right, sample_rate),
-            DemucsInner::Cpu(e) => e.separate(left, right, sample_rate),
+            DemucsInner::Cuda(e) => {
+                e.separate_with_progress(left, right, sample_rate, on_progress)
+            }
+            DemucsInner::Cpu(e) => {
+                e.separate_with_progress(left, right, sample_rate, on_progress)
+            }
         }
     }
 }

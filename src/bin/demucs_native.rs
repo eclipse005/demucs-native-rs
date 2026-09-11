@@ -104,7 +104,21 @@ fn main() -> anyhow::Result<()> {
 
     eprintln!("Separating {:.1}s of audio @ {} Hz", left.len() as f32 / sample_rate as f32, sample_rate);
     let t0 = std::time::Instant::now();
-    let stems = demucs.separate(&left, &right, sample_rate)?;
+    // Chunk-level progress on stderr (`\r`-updated; harmless when piped).
+    let mut last_percent = u32::MAX;
+    let stems = demucs.separate_with_progress(
+        &left,
+        &right,
+        sample_rate,
+        &mut |p| {
+            let percent = p.percent();
+            if percent != last_percent {
+                last_percent = percent;
+                eprint!("\r  progress {:>3}% ({}/{})", percent, p.done, p.total);
+            }
+        },
+    )?;
+    eprintln!();
     eprintln!("Done in {:.2}s", t0.elapsed().as_secs_f64());
 
     std::fs::create_dir_all(&output)?;

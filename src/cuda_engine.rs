@@ -26,7 +26,7 @@ use half::f16;
 use crate::metadata::ModelInfo;
 use crate::prebuilt_ptx;
 use crate::weights::WeightStore;
-use crate::{LoadOptions, Stem, StemSelection};
+use crate::{LoadOptions, SeparationProgress, Stem, StemSelection};
 
 // ═══════════════════════════════════════════════════════════════════════
 //  GpuTensor — owned f16 tensor on the GPU
@@ -670,7 +670,12 @@ impl CudaEngine {
 
     /// Long-audio path for bagged fine-tunes: sequential chunks via
     /// [`Self::separate_single_segment`] (runs every signature per chunk).
-    fn separate_chunked_bagged(&self, left: &[f32], right: &[f32]) -> Result<Vec<Stem>> {
+    fn separate_chunked_bagged(
+        &self,
+        left: &[f32],
+        right: &[f32],
+        on_progress: &mut dyn FnMut(SeparationProgress),
+    ) -> Result<Vec<Stem>> {
         let n_samples = left.len();
         let segment = TRAINING_LENGTH;
         let stride = segment * 3 / 4;
@@ -704,6 +709,10 @@ impl CudaEngine {
             for i in 0..chunk_len {
                 sum_weight[start + i] += window[i];
             }
+            on_progress(SeparationProgress {
+                done: chunk_idx + 1,
+                total: num_chunks,
+            });
         }
 
         let mut stems = Vec::with_capacity(n_stems);
@@ -734,6 +743,17 @@ impl CudaEngine {
         right: &[f32],
         sample_rate: u32,
     ) -> Result<Vec<Stem>> {
+        self.separate_with_progress(left, right, sample_rate, &mut |_| {})
+    }
+
+    /// [`Self::separate`] with chunk-level progress reporting.
+    pub fn separate_with_progress(
+        &self,
+        left: &[f32],
+        right: &[f32],
+        sample_rate: u32,
+        on_progress: &mut dyn FnMut(SeparationProgress),
+    ) -> Result<Vec<Stem>> {
         use std::borrow::Cow;
         let needs_resample = sample_rate != crate::SAMPLE_RATE as u32;
         let (left_in, right_in): (Cow<[f32]>, Cow<[f32]>) = if needs_resample {
@@ -751,13 +771,17 @@ impl CudaEngine {
 
         if n_samples <= TRAINING_LENGTH {
             let stems = self.separate_single_segment(left, right)?;
+            on_progress(SeparationProgress {
+                done: 1,
+                total: 1,
+            });
             return self.maybe_resample_stems(stems, needs_resample, sample_rate);
         }
 
         // Bagged fine-tune: every signature must run (mirrors CPU). Use sequential
         // chunking rather than the single-model prep/gpu/post pipeline.
         if self.models.len() > 1 {
-            let stems = self.separate_chunked_bagged(left, right)?;
+            let stems = self.separate_chunked_bagged(left, right, on_progress)?;
             return self.maybe_resample_stems(stems, needs_resample, sample_rate);
         }
 
@@ -854,6 +878,9 @@ impl CudaEngine {
         let out_left = std::sync::Arc::new(std::sync::Mutex::new(out_left));
         let out_right = std::sync::Arc::new(std::sync::Mutex::new(out_right));
         let sum_weight = std::sync::Arc::new(std::sync::Mutex::new(sum_weight));
+        // Post thread reports finished chunks so the caller thread can surface
+        // progress without sharing the (non-Send) callback across threads.
+        let (tx_done, rx_done) = std::sync::mpsc::channel::<usize>();
         let post_handle = {
             let out_left = out_left.clone();
             let out_right = out_right.clone();
@@ -896,12 +923,21 @@ impl CudaEngine {
                             sum_weight[start + i] += window[i];
                         }
                     }
+                    let _ = tx_done.send(chunk_idx);
                 }
             })
         };
 
         prep_handle.join().expect("prep thread panicked");
         gpu_handle.join().expect("gpu thread panicked");
+        let mut done = 0usize;
+        while rx_done.recv().is_ok() {
+            done += 1;
+            on_progress(SeparationProgress {
+                done,
+                total: num_chunks,
+            });
+        }
         post_handle.join().expect("post thread panicked");
 
         let sum_weight = std::sync::Arc::try_unwrap(sum_weight).unwrap().into_inner().unwrap();

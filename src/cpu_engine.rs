@@ -88,6 +88,17 @@ impl CpuEngine {
         right: &[f32],
         sample_rate: u32,
     ) -> anyhow::Result<Vec<Stem>> {
+        self.separate_with_progress(left, right, sample_rate, &mut |_| {})
+    }
+
+    /// [`Self::separate`] with chunk-level progress reporting.
+    pub fn separate_with_progress(
+        &self,
+        left: &[f32],
+        right: &[f32],
+        sample_rate: u32,
+        on_progress: &mut dyn FnMut(crate::SeparationProgress),
+    ) -> anyhow::Result<Vec<Stem>> {
         // ─── 0. Resample to 44100 Hz if needed ──────────────────────────
         let needs_resample = sample_rate != crate::SAMPLE_RATE as u32;
         let (left_in, right_in): (Cow<[f32]>, Cow<[f32]>) = if needs_resample {
@@ -105,7 +116,12 @@ impl CpuEngine {
 
         // ─── 1. Short audio fast path (≤ TRAINING_LENGTH) ───────────────
         let stems = if n_samples <= TRAINING_LENGTH {
-            self.separate_single_segment(left, right, n_samples)?
+            let stems = self.separate_single_segment(left, right, n_samples)?;
+            on_progress(crate::SeparationProgress {
+                done: 1,
+                total: 1,
+            });
+            stems
         } else {
             // ─── 2. Chunked inference for long audio ─────────────────────
             let segment = TRAINING_LENGTH;
@@ -145,6 +161,10 @@ impl CpuEngine {
                 for i in 0..chunk_len {
                     sum_weight[start + i] += window[i];
                 }
+                on_progress(crate::SeparationProgress {
+                    done: chunk_idx + 1,
+                    total: num_chunks,
+                });
             }
 
             // Normalize by accumulated weight.
