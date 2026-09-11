@@ -227,7 +227,9 @@ jobs:
             - `*-macos-arm64-cpu`
 
             CUDA builds require a local NVIDIA driver + CUDA 12 user-mode libraries.
-            Kernels are NVRTC-compiled for the **device arch at runtime** (e.g. GTX 1050 Ti sm_61).
+            Kernels ship as **precompiled multi-arch PTX** (sm_61…sm_90, embedded); at startup the
+            engine picks the newest arch ≤ your GPU's compute capability. No CUDA Toolkit / NVRTC
+            needed at runtime (e.g. GTX 1050 Ti uses the sm_61 blob).
 
             ### Quick test
             ```bash

@@ -22,7 +22,7 @@ GitHub Releases ship platform archives (models are **not** included):
 | `demucs-native-*-windows-x64-cuda12.zip` | Windows + CUDA 12 |
 | `demucs-native-*-macos-arm64-cpu.tar.gz` | Apple Silicon CPU |
 
-CUDA builds need a local **CUDA 12.x driver + runtime** (toolkit not required at runtime when using dynamic loading). They are compiled on GitHub runners **without a GPU**; real GPU testing is done on your machine. NVRTC compiles kernels for the **device arch at runtime** (not hard-coded to a specific SM).
+CUDA builds need a local **CUDA 12.x driver + runtime** (cudart / cuBLAS) — the toolkit, NVRTC, and a local compiler are **not** required at runtime. GPU kernels ship as **precompiled multi-arch PTX** (`sm_61`…`sm_90`) embedded in the binary; at startup the engine picks the newest prebuilt arch ≤ the device's compute capability, so no runtime compilation happens on user machines. The archives are compiled on GitHub runners **without a GPU**; real GPU testing is done on your machine.
 
 ### Linux
 
@@ -99,7 +99,15 @@ cargo build --release --no-default-features
 cargo build --release --features cuda
 ```
 
-`cudarc` uses `cuda-version-from-build-system` so the installed toolkit version is detected at build time. NVRTC loads `kernels.cu` and compiles for the GPU’s compute capability when you run.
+`cudarc` uses `cuda-version-from-build-system` so the installed toolkit version is detected at build time (build machines only). Runtime never compiles kernels: PTX for all supported arches is embedded via `src/prebuilt_ptx.rs`.
+
+### Regenerating the precompiled PTX (after editing `src/kernels/kernels.cu`)
+
+```powershell
+.\scripts\compile-ptx.ps1            # CUDA Toolkit 12.x + VS 2022 Build Tools
+```
+
+This rewrites `ptx/kernels_sm*.ptx` and `ptx/MANIFEST.txt`; commit both. PTX is forward-compatible, so `sm_90` also covers newer (Blackwell) parts through driver JIT.
 
 ## Features
 
@@ -115,9 +123,11 @@ src/
   lib.rs            Public API
   backend.rs        Backend::Auto | Cpu | Cuda
   cpu_engine.rs     gemm + rayon path
-  cuda_engine.rs    cudarc + cuBLAS + NVRTC
+  cuda_engine.rs    cudarc + cuBLAS + precompiled PTX kernels
   cuda_ops.rs       CUDA ops / timing aggregate
+  prebuilt_ptx.rs   multi-arch PTX selection (no NVRTC at runtime)
   kernels/kernels.cu
+  ../ptx/           compiled kernels_sm*.ptx + MANIFEST.txt
   bin/demucs_native.rs
 ```
 

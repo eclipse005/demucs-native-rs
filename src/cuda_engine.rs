@@ -1,11 +1,14 @@
 //! GPU-resident inference engine for HTDemucs v4.
 //!
 //! cuBLAS handles every GEMM (linear layers, im2col convolutions); hand-written
-//! NVRTC kernels handle element-wise ops (norms, activations, CaC reshaping).
-//! Weights stay on the device after load — no CPU↔GPU round-trips in the
-//! steady-state forward pass.
+//! kernels (see `src/kernels/kernels.cu`) handle element-wise ops (norms,
+//! activations, CaC reshaping). They ship as **precompiled multi-arch PTX**
+//! embedded in the binary (see [`crate::prebuilt_ptx`]), so runtime needs no
+//! NVRTC / CUDA Toolkit — only the driver + cudart / cuBLAS DLLs. Weights stay
+//! on the device after load — no CPU↔GPU round-trips in the steady-state
+//! forward pass.
 //!
-//! Status: skeleton — CudaState (context/stream/cuBLAS/NVRTC) is functional;
+//! Status: CudaState (context / stream / cuBLAS / PTX module) is functional;
 //! the conv/transformer/decoder operators are filled in incrementally.
 
 use std::sync::Arc;
@@ -17,14 +20,13 @@ use cudarc::driver::{
     safe::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, PushKernelArg},
     DevicePtr, DriverError, LaunchConfig,
 };
-use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
+use cudarc::nvrtc::Ptx;
 use half::f16;
 
 use crate::metadata::ModelInfo;
+use crate::prebuilt_ptx;
 use crate::weights::WeightStore;
 use crate::{LoadOptions, Stem, StemSelection};
-
-const KERNEL_SRC: &str = include_str!("kernels/kernels.cu");
 
 // ═══════════════════════════════════════════════════════════════════════
 //  GpuTensor — owned f16 tensor on the GPU
@@ -68,7 +70,7 @@ pub(crate) struct GpuWeightF16 {
 //  CudaState — context, stream, cuBLAS handle, kernel registry
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Registry of compiled NVRTC kernels, looked up by name.
+/// Kernel functions resolved from the loaded PTX module, looked up by name.
 #[allow(non_snake_case)]
 pub(crate) struct CudaKernels {
     pub noop: CudaFunction,
@@ -146,20 +148,15 @@ impl CudaState {
             sys::cublasSetMathMode(*blas.handle(), sys::cublasMath_t::CUBLAS_TENSOR_OP_MATH);
         }
 
-        // NVRTC: target native arch for better codegen.
-        let cuda_include = std::env::var("CUDA_PATH")
-            .map(|p| format!("{}/include", p))
-            .unwrap_or_else(|_| "/usr/local/cuda/include".to_string());
-        let arch: Option<&'static str> = ctx.compute_capability().ok().map(|(major, minor)| {
-            &*Box::leak(format!("sm_{}{}", major, minor).into_boxed_str())
-        });
-        let opts = CompileOptions {
-            arch,
-            include_paths: vec![cuda_include],
-            ..Default::default()
-        };
-        let ptx = compile_ptx_with_opts(KERNEL_SRC, opts)
-            .map_err(|e| anyhow!("kernel compile failed: {:?}", e))?;
+        // Scheme B: pick the newest embedded PTX whose target is ≤ this device.
+        // No NVRTC, no toolkit, no runtime compilation on end-user machines.
+        let (major, minor) = ctx
+            .compute_capability()
+            .map_err(|e| anyhow!("compute_capability failed: {e:?}"))?;
+        let (ptx_src, selected_sm) = prebuilt_ptx::resolve_ptx_for_device(major, minor)
+            .map_err(|e| anyhow!("{e}"))?;
+        log::info!("CUDA: device sm_{major}{minor} → prebuilt PTX sm_{selected_sm}");
+        let ptx = Ptx::from_src(ptx_src);
 
         // Load PTX as a module, then resolve kernel functions from it.
         let module = ctx

@@ -1,7 +1,7 @@
 //! GPU-side ops for HTDemucs v4.
 //!
 //! Each op corresponds to a CPU op in `ops_cpu.rs`. Implementations use
-//! cuBLAS for matmul-backed ops (linear / conv / MHA) and NVRTC kernels
+//! cuBLAS for matmul-backed ops (linear / conv / MHA) and precompiled-PTX kernels
 //! for element-wise ops. All storage is f16; arithmetic uses f32
 //! accumulation in the kernels.
 //!

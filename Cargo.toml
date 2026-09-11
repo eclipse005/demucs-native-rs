@@ -30,6 +30,8 @@ hound = "3"
 
 # CUDA backend (optional). Detect toolkit version from nvcc at build time so
 # CI / local boxes with any CUDA 12.x install work without hardcoding 12.8.
+# Runtime needs no toolkit and no NVRTC: kernels are embedded as precompiled
+# multi-arch PTX (src/prebuilt_ptx.rs, regenerate via scripts/compile-ptx.ps1).
 cudarc = { version = "0.19", features = ["cublas", "f16", "cuda-version-from-build-system"], optional = true }
 
 [dev-dependencies]

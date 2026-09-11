@@ -12,8 +12,7 @@
 #define INFINITY __int_as_float(0x7f800000)
 #endif
 
-// Placeholder kernel so NVRTC has something to compile. Removed once real
-// kernels are present.
+// Placeholder kernel so the PTX module always exports at least one symbol.
 extern "C" __global__ void __launch_bounds__(256)
 noop_placeholder(__half* __restrict__ x, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;

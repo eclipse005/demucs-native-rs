@@ -6,7 +6,7 @@
 //!
 //! Two backends:
 //! - **CPU** (default): gemm crate + rayon, pure Rust
-//! - **CUDA** (`--features cuda`): cuBLAS GEMM + hand-written NVRTC kernels
+//! - **CUDA** (`--features cuda`): cuBLAS GEMM + hand-written precompiled-PTX kernels
 //!
 //! Both backends store weights as f16 and compute in f32.
 
@@ -24,6 +24,9 @@ pub mod cuda_engine;
 
 #[cfg(feature = "cuda")]
 pub mod cuda_ops;
+
+#[cfg(feature = "cuda")]
+pub mod prebuilt_ptx;
 
 #[cfg(feature = "cuda")]
 pub mod gpu_model;
